@@ -1,0 +1,46 @@
+name:                auc
+version:             0.1.0.0
+-- synopsis:
+-- description:
+homepage:            https://github.com/githubuser/auc#readme
+license:             BSD3
+license-file:        LICENSE
+author:              Maurizio Di Pietro
+maintainer:          maurizio.di.pietro@gmail.com
+copyright:           2020 Maurizio Di Pietro
+category:            Web
+build-type:          Simple
+extra-source-files:  README.md
+cabal-version:       >=1.10
+
+executable aucexe
+  hs-source-dirs:      exe
+  main-is:             Main.hs
+  build-depends:       base >= 4.7 && < 5,
+                       proteaaudio,
+                       auc
+  default-language:    Haskell2010
+  GHC-Options:         -O2  
+  -- -prof -fprof-auto -rtsopts -fprof-cafs
+
+library
+  hs-source-dirs:      src
+  exposed-modules:     AUC
+  build-depends:       base >= 4.7 && < 5,
+                      -- transformers,
+                       mtl,
+                       MonadRandom,
+                       containers,
+                       vector,
+                       hsndfile,
+                       hsndfile-vector,
+                       proteaaudio,
+                       bytestring,
+                       bytestring-to-vector
+  default-language:    Haskell2010
+  GHC-Options:         -O2 
+  -- -fprof-auto -fprof-cafs
+
+source-repository head
+  type:     git
+  location: https://github.com/githubuser/auc
