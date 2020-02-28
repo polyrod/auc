@@ -9,7 +9,7 @@ import System.IO
 main = do
   hSetBuffering stdin NoBuffering
   initAudio 1 44100 512
-  btest
+  myplay
   --threadDelay $ 1000000 * 30
   c <- getChar
   putStrLn "Bye!"

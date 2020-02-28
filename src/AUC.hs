@@ -1,8 +1,10 @@
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module AUC
   (
---  myplay,
+  myplay,
 --  atest ,
 --  btest 
   ) where
@@ -27,10 +29,41 @@ import Control.Monad.RWS
 import Control.Monad.Random
 
 data AUCEnv = AUCEnv
-data AUCState = AUCState
+
+instance Monoid AUCEnv where
+  mempty = AUCEnv
+
+instance Semigroup AUCEnv where
+  a <> b = AUCEnv
+
+data AUCState = AUCState { 
+  _svol :: AUVol,
+  _rndGen :: StdGen
+                         }
 data AUCLog = AUCLog
 
-type AUC a = RWST AUCEnv AUCLog AUCState (Rand StdGen) a
+instance Monoid AUCLog where
+  mempty = AUCLog
+
+instance Semigroup AUCLog where
+  a <> b = AUCLog
+
+
+
+--- ????
+instance Monoid Float where
+  mempty = 1.0
+instance Semigroup Float where
+  a <> b = a * b
+
+newtype AUC r w s a = AUCT { getAUC :: RWST r w s (Rand StdGen) a }
+  deriving (Functor,Applicative,Monad,MonadReader r,MonadWriter w,MonadState s,MonadRandom)
+
+--runAUC :: AUC r w s a -> r -> w -> s -> IO a
+runAUC auc r s  =  
+     evalRand ( runRWST (getAUC auc) r s ) 
+
+
 
 type AULen = Int
 
@@ -67,96 +100,124 @@ data AUSel =
     , _off :: AUOff
     , _len :: AULen
     }
-
 --  | Par AUSel AUSel
 --  | Ser AUSel AUSel
+
+
+
+
+--
 newtype AUPhsr =
   AUPhsr
-    { _next :: AUSel -> AUIdx -> AUIdx
+    { 
+    _next :: AUC AUX (AUVol -> AUVol) AUIdx AUIdx
     }
 
 instance Semigroup AUPhsr where
   pa <> pb =
-    AUPhsr $ \as ai ->
-      let ai_a = _next pa as ai
-       in _next pb as ai_a
+    AUPhsr $ do 
+      _next pa
+      _next pb
 
 instance Monoid AUPhsr where
-  mempty = AUPhsr $ \_ ai -> ai
+  mempty = AUPhsr get
+
 
 checkRel (Rel r) =
   if | r < 0.0 || r > 1.0 -> Done
      | True -> Rel r
 
-defaultPhsr =
-  AUPhsr
-    (\sel idx ->
-       case idx of
+defaultPhsr = AUPhsr $ do
+   idx <- get
+   sel <- asks _sel
+   let idx' = case idx of
          Abs a -> checkRel $ Rel $ fromIntegral a / fromIntegral (_len sel)
          Rel r ->
            checkRel $
            Rel r 
-         Done -> Done)
+         Done -> Done
+   put idx' 
+   return idx' 
 
-reversePhsr =
-  AUPhsr
-    (\sel idx ->
-       case idx of
+reversePhsr = AUPhsr $ do
+   idx <- get
+   sel <- asks _sel
+   let idx' = case idx of
          Abs a ->
            checkRel $ Rel $ 1 - (fromIntegral a / fromIntegral (_len sel))
          Rel r ->
            checkRel $
-           Rel $ (1 - r) 
-         Done -> Done)
+           Rel (1 - r) 
+         Done -> Done
+   put idx' 
+   return idx' 
 
-pitchPhsr p =
-  AUPhsr
-    (\sel idx ->
-       case idx of
+pitchPhsr p = AUPhsr $ do 
+   idx <- get
+   sel <- asks _sel
+   let idx' = case idx of
          Abs a ->
-           checkRel $ Rel $ (fromIntegral a / (p * fromIntegral (_len sel)))
+           checkRel $ Rel (fromIntegral a / (p * fromIntegral (_len sel)))
          Rel r ->
            checkRel $
            Rel $ r / p
-         Done -> Done)
+         Done -> Done
+   put idx' 
+   return idx' 
 
-stutterPhsr p =
-  AUPhsr
-    (\sel idx ->
-       case idx of
-         Abs a -> 
-           let r = fromIntegral a / (fromIntegral (_len sel))
-            in if r > 1.0
-                then Done
-                else checkRel $ Rel $ r `mod'` p
-         Rel r ->
-           checkRel $
-           Rel $ r `mod'` p 
-         Done -> Done)
 
+idxAp :: (AUIdx -> AUIdx) -> AUIdx -> AUIdx
+idxAp f Done = Done
+idxAp f i = f i
+
+idxToRel :: AUSel -> AUIdx -> AUIdx
+idxToRel _ Done = Rel 1.0
+idxToRel s (Abs a) = checkRel $ Rel $ fromIntegral a / fromIntegral (_len s)
+idxToRel s (Rel r) = checkRel $ Rel r
+
+fromRel :: AUSel -> AUIdx -> AURatio
+fromRel s i = let (Rel r ) = idxToRel s i in r
+
+stutterPhsr p = AUPhsr $ do 
+   idx <- get
+   sel <- asks _sel
+   if idx == Done 
+     then return Done
+     else do 
+       let r = fromRel sel idx
+           r' = r `mod'` p 
+           vs = if | r' < (p/100) -> linFadeInEnv 1 r'
+                   | r' > (p - (p/100)) -> linFadeOutEnv 1 r'             
+                   | True -> 1
+       tell (* vs)        
+       let idx' = checkRel $ Rel r' 
+       put idx' 
+       return idx' 
 
 data AUX =
   AUX
     { _sel   :: AUSel
     , _ticks :: AUTick
-    , _phsr  :: AUPhsr
+    , _phsr  :: AUPhsr 
     , _done  :: Bool
     , _vol   :: AURatio -> AUVol
     }
 
 cVol :: AUVol -> AURatio -> AUVol
-cVol v = const v
+cVol = const 
 
 linFadeOutEnv :: AUVol -> AURatio -> AUVol
 linFadeOutEnv v r = v * (1-r) 
 
 linFadeInEnv :: AUVol -> AURatio -> AUVol
-linFadeInEnv v r = v * (r) 
+linFadeInEnv v r = v * r 
 
+type AUDeck = [AUX]
+
+  {-
 newAUX sel =
   AUX sel (-4410) (pitchPhsr (1.0 - (0.5 / 12.0) * 5.0) <> defaultPhsr) False (cVol 1.0)
 
-type AUDeck = [AUX]
 
 renderDeck :: AUDeck -> SV.Vector AUSample
 renderDeck d = renderDeck' d SV.empty
@@ -173,30 +234,37 @@ renderDeck' d v =
         then v
         else renderDeck' as (SV.snoc v s)
 
-renderDeckBS :: AUDeck -> BS.ByteString
+
+-}
+
+--renderDeckBS :: AUDeck -> BS.ByteString
 renderDeckBS d = renderDeckBS' d mempty
 
-renderDeckBS' :: AUDeck -> BS.Builder -> BS.ByteString
-renderDeckBS' d b =
+--renderDeckBS' :: AUDeck -> BS.Builder -> BS.ByteString
+renderDeckBS' d b = do
   let d' = filter (not . _done) d
-      etrip = map extract d'
       aux (a, _, _) = a
       smp (_, _, s) = s
-      s = foldl  (\a b -> a + smp b) 0 etrip
+  etrip <- mapM extract d'
+  let s = foldl  (\a b -> a + smp b) 0 etrip
       as = map aux etrip
-   in if null d'
-        then BS.toLazyByteString b
-        else renderDeckBS' as (b <> BS.floatLE s)
+  if null d'
+            then return $ BS.toLazyByteString b
+            else renderDeckBS' as (b <> BS.floatLE s)
 
-extract :: AUX -> (AUX, AUIdx, AUSample)
-extract aux =
+
+--extract :: AUX -> AUC AUCEnv AUCLog AUCState (AUX, AUIdx, AUSample)
+extract aux = do
   let t' = _ticks aux + 1
-      i = (_next $ _phsr aux) (_sel aux) (Abs $ _ticks aux)
-   in if | Done == i -> (aux {_done = True}, i, 0)
-         | t' < 0 -> (aux {_ticks = t'}, Abs t', 0)
-         | otherwise ->
-           let ri = (fromIntegral t') / fromIntegral (_len $ _sel aux)  
-               s = (_vol aux $ ri) * sampleAt (_sel aux) i
+  g <- gets _rndGen
+  modify (\s ->  s { _rndGen = (snd . split) $ _rndGen s}) 
+  let (i,s,vf)  = runAUC  (_next $ _phsr aux) aux (Abs $ _ticks aux) g
+  return $ 
+    if | Done == i -> (aux {_done = True}, i, 0)
+       | t' < 0 -> (aux {_ticks = t'}, Abs t', 0)
+       | otherwise ->
+           let ri = fromIntegral t' / fromIntegral (_len $ _sel aux)  
+               s = vf ( _vol aux ri) * sampleAt (_sel aux) i
             in (aux {_ticks = t'}, i, s)
 
 progress :: AUX -> AUIdx -> AURatio
@@ -217,8 +285,8 @@ sampleAt sel i =
       mc = do
         ri <- mb
         au <- M.lookup (_id sel) (_lib sel)
-        let rat = (ri * fromIntegral (_len sel))
-            frct = rat - (fromIntegral $ floor rat)
+        let rat = ri * fromIntegral (_len sel)
+            frct = rat - fromIntegral (floor rat)
             li = floor rat
             ui = ceiling rat
         lv <- _data au SV.!? (_off sel + li)
@@ -249,26 +317,26 @@ createAULib fns = do
 newAU :: SV.Vector AUSample -> AU
 newAU v = AU v $ SV.length v
 
-  {-
 myplay = do
   putStrLn "Creating Lib"
-  lib <- createAULib ["dark.ogg","amen.wav"]
-  let s0 = AUSel lib "dark.ogg" 0 96000
+  lib <- createAULib ["amen.wav"]
   putStrLn "Creating Selection"
   let s1 = AUSel lib "amen.wav" 30000 96000
   putStrLn "Creating Extractor"
-  let aux1 = AUX s1 0 (defaultPhsr ) False (cVol 1)
-  let d0 = AUX s0 0 (defaultPhsr <> pitchPhsr (1.1 * 44100.0/48000.0)) False (cVol 0.7)
-  let aux2 = AUX s1 (-30) (pitchPhsr 0.99) False (cVol 1)
-  let aux3 = AUX s1 0 (defaultPhsr <> reversePhsr ) False (cVol 1)
-  let aux4 = AUX s1 0 (defaultPhsr) False (cVol 1)
+  let aux1 = AUX s1 0 (defaultPhsr <> reversePhsr) False (cVol 1)
+  let aux4 = AUX s1 0 defaultPhsr False (cVol 1)
   putStrLn "Rendering Deck"
-  let s0 = renderDeckBS [aux1,aux2,aux3]
-  let s1 = renderDeckBS [aux3,d0]
-  let s2 = renderDeckBS [aux1,aux2,d0]
-  let s3 = renderDeckBS [aux1,d0]
-  let s4 = renderDeckBS [aux4]
-  let s = s0 <> s1 <> s2 <> s3 <> s4 
+  g <- getStdGen
+  let st = AUCState 1 g 
+  let (s,_,()) = runAUC (do
+            s0 <- renderDeckBS [aux1]
+            s1 <- renderDeckBS [aux1]
+            s2 <- renderDeckBS [aux1,aux4]
+            s3 <- renderDeckBS [aux1]
+            s4 <- renderDeckBS [aux4]
+            let s = s0 <> s1 <> s2 <> s3 <> s4 
+            return s
+         ) AUCEnv st g
     --let s = SVBS.vectorToByteString rd
   putStrLn $ "Length of rendered Deck : " ++ show (BS.length s)
   putStrLn "Convering rendered Deck to MemSample"
@@ -277,6 +345,7 @@ myplay = do
   putStrLn "Playing MemSample"
   soundLoop smp 1.0 1.0 0.0 1.0
 
+{-
 atest = do
   putStrLn "Creating Lib"
   lib <- createAULib ["fatamen.wav"]
