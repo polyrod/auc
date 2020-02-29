@@ -18,10 +18,35 @@ executable aucexe
   main-is:             Main.hs
   build-depends:       base >= 4.7 && < 5,
                        proteaaudio,
+                       random,
+                       mtl,
+                       MonadRandom,
+                       bytestring,
                        auc
   default-language:    Haskell2010
   GHC-Options:         -O2  
   -- -prof -fprof-auto -rtsopts -fprof-cafs
+
+executable ExplJack
+  hs-source-dirs:      exe
+  main-is:             ExplJack.hs
+  build-depends:       base >= 4.7 && < 5
+                      ,jack
+                      ,transformers
+                      ,random
+                      ,explicit-exception
+                      ,array
+                      ,vector
+                      ,containers
+                      ,event-list
+                      ,midi
+                      ,mtl
+                      ,MonadRandom
+                      ,bytestring
+                      ,auc
+
+  default-language:    Haskell2010
+  GHC-Options:         -O2  -threaded
 
 library
   hs-source-dirs:      src
