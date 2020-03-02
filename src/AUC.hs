@@ -1,6 +1,8 @@
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiWayIf                 #-}
+{-# LANGUAGE ExplicitForAll             #-}
+{-# LANGUAGE RankNTypes             #-}
 
 module AUC
   ( createAULib
@@ -10,6 +12,7 @@ module AUC
   , stutterPhsr
   , reversePhsr
   , pitchPhsr
+  , timestretchPhsr
   , linFadeInEnv
   , linFadeOutEnv
   , cVol
@@ -43,6 +46,8 @@ import           Data.Maybe                       (fromMaybe)
 import           Control.Monad
 import           Control.Monad.Random
 import           Control.Monad.RWS
+
+import Debug.Trace
 
 data AUCEnv =
   AUCEnv
@@ -130,9 +135,33 @@ data AUSel =
 --  | Par AUSel AUSel
 --  | Ser AUSel AUSel
 --
+--
+
+data AUX
+  = AUXS [AUX]
+  | AUXP [AUX]
+  | AUX
+      { _sel   :: AUSel
+      , _ticks :: AUTick
+      , _phsr  :: AUPhsr 
+      , _done  :: Bool
+      , _vol   :: AURatio -> AUVol
+      }
+
+
+type AUDeck = [AUX]
+
+class HasAUIdx a where
+  getIdx :: a -> AUIdx
+  putIdx :: AUIdx -> a -> a
+
+instance HasAUIdx AUIdx where
+  getIdx = id 
+  putIdx i a = i
+
 newtype AUPhsr =
   AUPhsr
-    { _next :: AUC AUX (AUVol -> AUVol) AUIdx AUIdx
+    { _next :: forall i . (HasAUIdx i) => AUC AUX (AUVol -> AUVol) i AUIdx 
     }
 
 instance Semigroup AUPhsr where
@@ -142,7 +171,7 @@ instance Semigroup AUPhsr where
       _next pb
 
 instance Monoid AUPhsr where
-  mempty = AUPhsr get
+  mempty = AUPhsr $ gets getIdx
 
 checkRel (Rel r) =
   if | r < 0.0 || r > 1.0 -> Done
@@ -150,19 +179,21 @@ checkRel (Rel r) =
 
 defaultPhsr =
   AUPhsr $ do
-    idx <- get
+    st <- get
+    let idx = getIdx st
     sel <- asks _sel
     let idx' =
           case idx of
             Abs a -> checkRel $ Rel $ fromIntegral a / fromIntegral (_len sel)
             Rel r -> checkRel $ Rel r
             Done -> Done
-    put idx'
+    put $ putIdx idx' st
     return idx'
 
 reversePhsr =
   AUPhsr $ do
-    idx <- get
+    st <- get
+    let idx = getIdx st
     sel <- asks _sel
     let idx' =
           case idx of
@@ -170,12 +201,13 @@ reversePhsr =
               checkRel $ Rel $ 1 - (fromIntegral a / fromIntegral (_len sel))
             Rel r -> checkRel $ Rel (1 - r)
             Done -> Done
-    put idx'
-    return idx'
+    put $ putIdx idx' st
+    return idx' 
 
 pitchPhsr p =
   AUPhsr $ do
-    idx <- get
+    st <- get
+    let idx = getIdx st
     sel <- asks _sel
     let idx' =
           case idx of
@@ -183,8 +215,9 @@ pitchPhsr p =
               checkRel $ Rel (fromIntegral a / (p * fromIntegral (_len sel)))
             Rel r -> checkRel $ Rel $ r / p
             Done -> Done
-    put idx'
-    return idx'
+    put $ putIdx idx' st
+    return idx' 
+
 
 idxAp :: (AUIdx -> AUIdx) -> AUIdx -> AUIdx
 idxAp f Done = Done
@@ -192,8 +225,8 @@ idxAp f i    = f i
 
 idxToRel :: AUSel -> AUIdx -> AUIdx
 idxToRel _ Done    = Rel 1.0
-idxToRel s (Abs a) = checkRel $ Rel $ fromIntegral a / fromIntegral (_len s)
-idxToRel s (Rel r) = checkRel $ Rel r
+idxToRel s (Abs a) = Rel $ fromIntegral a / fromIntegral (_len s)
+idxToRel s (Rel r) = Rel r
 
 fromRel :: AUSel -> AUIdx -> AURatio
 fromRel s i =
@@ -202,10 +235,11 @@ fromRel s i =
 
 stutterPhsr p =
   AUPhsr $ do
-    idx <- get
+    st <- get
+    let idx = getIdx st
     sel <- asks _sel
     if idx == Done
-      then return Done
+      then return idx
       else do
         let r = fromRel sel idx
             r' = r `mod'` p
@@ -215,19 +249,67 @@ stutterPhsr p =
                  | True -> 1
         tell (* vs)
         let idx' = checkRel $ Rel r'
-        put idx'
-        return idx'
+        put $ putIdx idx' st
+        return idx' 
 
-data AUX
-  = AUXS [AUX]
-  | AUXP [AUX]
-  | AUX
-      { _sel   :: AUSel
-      , _ticks :: AUTick
-      , _phsr  :: AUPhsr
-      , _done  :: Bool
-      , _vol   :: AURatio -> AUVol
-      }
+
+
+  {-
+
+
+  0123456789
+  abcdefghij  
+  0123456789           <- r
+
+
+
+  00112233445566778899
+  a b c d e f g h i j 
+  0123456789.........  <- r' = r / t
+
+  slot = idx / gr
+
+
+
+
+
+  r'(r) = t * (g(r) + gi(r))
+
+  g(r) = r / (1/200) 
+  gi(r) =  g(r) - trnc(g(r)) * 2 % 1
+
+  -}
+timestretchPhsr gc p' t' =
+  AUPhsr $ do
+    st <- get
+    let idx = getIdx st
+    sel <- asks _sel
+    if idx == Done
+      then return idx
+      else do
+        let p = p' 
+        let t = t' 
+        let gs = fromIntegral (_len sel) / fromIntegral gc
+            r = fromRel sel idx
+            g = (r) * (fromIntegral gc)
+            gn =  fromIntegral $ truncate g
+            gi = ((g - gn) * t) `mod'` 1
+            r' = (p/t) * (gn + gi) / fromIntegral gc
+            out =  " r: " ++ (show r)
+                ++ " g: " ++ (show g)
+                ++ " gn: " ++ (show gn)
+                ++ " gi: " ++ (show gi)
+                ++ " r': " ++ (show r')
+            vs =
+              if | (g-gn) < (1 / 100) -> linFadeInEnv 1 (g-gn) 
+                 | (g-gn) > (1 - (1 / 100)) -> linFadeOutEnv 1 (g-gn)
+                 | True -> 1
+        tell (*vs)
+        let idx' = checkRel $ Rel r'
+        put $ putIdx idx' st
+        return idx'
+        --return $ traceShow out idx'
+
 
 cVol :: AUVol -> AURatio -> AUVol
 cVol = const
@@ -238,7 +320,6 @@ linFadeOutEnv v r = v * (1 - r)
 linFadeInEnv :: AUVol -> AURatio -> AUVol
 linFadeInEnv v r = v * r
 
-type AUDeck = [AUX]
   {-
 newAUX sel =
   AUX sel (-4410) (pitchPhsr (1.0 - (0.5 / 12.0) * 5.0) <> defaultPhsr) False (cVol 1.0)
@@ -294,7 +375,7 @@ renderDeckBS' d b = do
     then return $ BS.toLazyByteString b
     else renderDeckBS' as (b <> BS.floatLE s)
 
---extract :: AUX -> AUC AUCEnv AUCLog AUCState (AUX, AUIdx, AUSample)
+extract :: MonadState AUCState m => AUX -> m (AUX, AUIdx, AUSample)
 extract (AUXS [aux]) = extract aux 
 extract (AUXS (aux:auxs)) = do
   (aux',idx,s) <- extract aux
@@ -317,6 +398,7 @@ extract aux = do
   let t' = _ticks aux + 1
   g <- gets _rndGen
   modify (\s -> s {_rndGen = (snd . split) $ _rndGen s})
+  
   let (i, s, vf) = runAUC aux (Abs $ _ticks aux) g (_next $ _phsr aux)
   return $
     if | Done == i -> (aux {_done = True}, i, 0)
@@ -375,81 +457,6 @@ createAULib fns = do
 newAU :: SV.Vector AUSample -> AU
 newAU v = AU v $ SV.length v
 {-
-atest = do
-  putStrLn "Creating Lib"
-  lib <- createAULib ["fatamen.wav"]
-  putStrLn "Creating Selection"
-  let s0 = AUSel lib "fatamen.wav" (0 * 74325 `div` 10) (1 * 74325 `div` 10)
-  let s1 = AUSel lib "fatamen.wav" (1 * 74325 `div` 10) (1 * 74325 `div` 10)
-  let s2 = AUSel lib "fatamen.wav" (2 * 74325 `div` 10) (1 * 74325 `div` 10)
-  let s3 = AUSel lib "fatamen.wav" (3 * 74325 `div` 10) (6 * 74325 `div` 10)
-  putStrLn "Creating Extractor"
-  let aux1 = AUX s1 0 (pitchPhsr 2.0 <> defaultPhsr <> stutterPhsr 0.2 ) False (cVol 1)
-  let aux2 = AUX s2 0 (defaultPhsr) False (cVol 1)
-  let aux3 = AUX s0 0 (defaultPhsr) False (cVol 1)
-  let aux4 = AUX s3 0 (defaultPhsr) False (cVol 1)
-  putStrLn "Rendering Deck"
-  let s0 = renderDeckBS [aux1]
-  let s1 = renderDeckBS [aux2,aux1]
-  let s2 = renderDeckBS [aux3]
-  let s3 = renderDeckBS [aux4]
-  let s = s0 <> s1 <> s2 <> s1 <> s0 <> s0 <> s2 <> s2 <> s1 <> s3
-  putStrLn $ "Length of rendered Deck : " ++ show (BS.length s)
-  putStrLn "Convering rendered Deck to MemSample"
-  smp <- sampleFromMemoryPcm (BS.toStrict s) 1 22050 32 1.0
-  putStrLn "Playing MemSample"
-  soundLoop smp 1.0 1.0 0.0 1.0
-
-btest = do
-  putStrLn "Creating Lib"
-  lib <- createAULib ["fatamen.wav"]
-  putStrLn "Creating Selection"
-  let s0 = AUSel lib "fatamen.wav" (0 * 74325 `div` 10) (2 * 74325 `div` 10)
-  let s1 = AUSel lib "fatamen.wav" (3 * 74325 `div` 10) (2 * 74325 `div` 10)
-  let s2 = AUSel lib "fatamen.wav" (5 * 74325 `div` 10) (2 * 74325 `div` 10)
-  let s3 = AUSel lib "fatamen.wav" (7 * 74325 `div` 10) (2 * 74325 `div` 10)
-  let s4 = AUSel lib "fatamen.wav" (9 * 74325 `div` 10) (2 * 74325 `div` 10)
-  let s5 = AUSel lib "fatamen.wav" (2 * 74325 `div` 10) (3 * 74325 `div` 10)
-  putStrLn "Creating Extractor"
-  let aux0 = AUX s0 0 (defaultPhsr) False (cVol 1)
-  let aux1 = AUX s1 0 (stutterPhsr 0.125 <> pitchPhsr 1.0 ) False (linFadeOutEnv 1)
-  let aux2 = AUX s2 0 (defaultPhsr) False (cVol 1)
-  let aux3 = AUX s3 0 (defaultPhsr) False (cVol 1)
-  let aux4 = AUX s4 0 (defaultPhsr) False (cVol 1)
-  let aux5 = AUX s5 0 (defaultPhsr) False (cVol 1)
-  putStrLn "Rendering Deck"
-  let s0 = renderDeck [aux0]
-  let s1 = renderDeck [aux1]
-  let s2 = renderDeck [aux2]
-  let s3 = renderDeck [aux3]
-  let s4 = renderDeck [aux4]
-  let s5 = renderDeck [aux5]
-  let s = s0 <> s1 <> s2 <> s3 <> s1 <> s1 <> s4
-  putStrLn $ "Length of rendered Deck : " ++ show (SV.length s)
-
-  let nau = newAU s
-      lib' = M.insert "newbk" nau lib
-
-  let s0 = AUSel lib' "newbk" 0 (_dur nau)
-  let aux0 = AUX s0 0 (defaultPhsr) False (cVol 1)
-  let aux1 = AUX s0 0 (reversePhsr ) False (cVol 1)
-  let aux2 = AUX s0 0 (pitchPhsr (1 + (6 * (0.5 / 12)))) False (cVol 1)
-  let aux3 = AUX s0 0 (pitchPhsr 2.0 <> stutterPhsr (1/28) <> pitchPhsr 2.0 ) False (linFadeInEnv 1)
-
-  let s0 = renderDeckBS [aux0]
-  let s1 = renderDeckBS [aux0,aux1]
-  let s2 = renderDeckBS [aux2]
-  let s3 = renderDeckBS [aux0,aux2]
-  let s4 = renderDeckBS [aux3]
-  let s = s4 <> s0 <> s0 <> s0 <> s1 <> s2 <> s0
-
-  putStrLn "Convering rendered Deck to MemSample"
-  smp <- sampleFromMemoryPcm (BS.toStrict s) 1 22050 32 1.0
-  putStrLn "Playing MemSample"
-  soundLoop smp 1.0 1.0 0.0 1.0
-
--}
-{-
 createLib ----> Lib
                 |
                 |
@@ -470,12 +477,6 @@ createLib ----> Lib
                 |
                 v
                AUDeck
-
-
-
-
-
-State + Rnd + IORef + Reader
 
 
 

@@ -42,9 +42,9 @@ import           System.IO
 
 import AUC
 
-data PlayState =  PlayState { _deck :: AUDeck }
+data PlayState =  PlayState { _deck :: AUDeck , _tsv :: Float  , _psv :: Float , _gc :: Int }
 
-initState = pure $ PlayState []
+initState = pure $ PlayState [] 1.0 1.0 100
 
 mainWait ::
      JackExc.ThrowsErrno e
@@ -59,29 +59,57 @@ mainWait client name psr =
     hSetBuffering stdout NoBuffering
     hSetBuffering stdin NoBuffering
 
-
-    lib <- createAULib ["fatamen.wav"]
-    let s1 = AUSel lib "fatamen.wav" 0 74325
+    lib <- createAULib ["fatamen.wav","kleinekakanudel.wav"]
+    let s1 = AUSel lib "kleinekakanudel.wav" 0 66000
     let s2 = AUSel lib "fatamen.wav" 3000 71325
     let s3 = AUSel lib "fatamen.wav" 20000 54325
-    let aux1 = AUX s1 0 (defaultPhsr) False (cVol 1.0)
-    let aux2 = AUX s2 0 (reversePhsr) False (cVol 1.0)
-    let aux3 = AUX s3 0 (defaultPhsr <> stutterPhsr 0.1) False (linFadeOutEnv 1.0)
-
-    let auxA = AUXS [aux1,aux2,aux3]
-    let auxB = AUXP [aux1,aux2,aux3]
 
     forever $ do
+      ps <- readIORef psr
+
+      let aux1 = AUX s1 0 (defaultPhsr) False (cVol 1.0)
+      let aux2 = AUX s2 0 (reversePhsr) False (cVol 1.0)
+      let aux3 = AUX s3 0 (defaultPhsr <> stutterPhsr 0.1) False (linFadeOutEnv 1.0)
+      let aux4 = AUX s1 0 (timestretchPhsr (_gc ps) (_psv ps) (_tsv ps)) False (cVol 1.0)
+
+
+      let auxA = AUXS [aux1,aux2,aux3]
+      let auxB = AUXP [aux1,aux2,aux3]
+      let auxC = aux4
+
       putStr ">"
       inp <- getChar
       case inp of
+        'n' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps { _tsv = _tsv ps - 0.1 }
+        'm' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps { _tsv = _tsv ps + 0.1 }
+        'j' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps { _psv = _psv ps - 0.1 }
+        'k' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps { _psv = _psv ps + 0.1 }
+        'u' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps { _gc = _gc ps - 50 }
+        'i' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps { _gc = _gc ps + 50 }
         'a' -> do
           ps <- readIORef psr
           writeIORef psr $ ps { _deck = (auxA : (_deck ps)) }
         'b' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _deck = (auxB : (_deck ps)) }
+          writeIORef psr $ ps { _deck = (auxC : (_deck ps)) }
         _   -> pure ()
+        
+      ps <- readIORef psr
+      putStrLn $  " TSV : " ++ (show $ _tsv ps) 
+               ++ " PSV : " ++ (show $ _psv ps) 
+               ++ " GC  : " ++ (show $ _gc ps) 
     Jack.waitForBreak
 
 main :: IO ()
@@ -182,13 +210,13 @@ processAudioOut psr input output nframes@(JACK.NFrames nframesInt) = do
       idxs ->
         mapM_
           (\i@(JACK.NFrames ii) -> do
-             f <- hits2nextFrame psr i
+             f <- nextFrame psr i
              writeArray outArr i (CT.CFloat f))
           idxs
 
 
-hits2nextFrame :: IORef PlayState -> Jack.NFrames -> IO Float
-hits2nextFrame psr i = do
+nextFrame :: IORef PlayState -> Jack.NFrames -> IO Float
+nextFrame psr i = do
   ps <- readIORef psr
   g <- newStdGen
   let (s,_,d') = (runAUC (_deck ps) (AUCState 1.0 g) g nextFrameFromDeck) 
