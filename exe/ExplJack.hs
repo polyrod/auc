@@ -1,4 +1,5 @@
 {-# LANGUAGE MultiWayIf #-}
+
 module Main where
 
 import qualified Sound.JACK                          as JACK
@@ -17,7 +18,6 @@ import           Data.Array.Storable                 (writeArray)
 import           Data.IORef                          (IORef, newIORef,
                                                       readIORef, writeIORef)
 
-
 import qualified Data.EventList.Absolute.TimeBody    as EventList
 import qualified Data.Map                            as M
 import qualified Data.Vector.Generic                 as VG
@@ -26,6 +26,7 @@ import qualified Sound.MIDI.Message                  as MM
 import qualified Sound.MIDI.Message.Channel          as MMC
 import qualified Sound.MIDI.Message.Channel.Voice    as MMV
 
+import           GHC.Float
 import           GHC.Int
 import           GHC.Word
 
@@ -37,14 +38,26 @@ import           System.Mem
 import qualified Control.Monad.Exception.Synchronous as Sync
 import qualified Control.Monad.Trans.Class           as Trans
 
-import           Control.Monad                       (forever)
+import           Control.Monad                       (foldM, forever,
+                                                      replicateM)
+import           Control.Monad.Random
 import           System.IO
 
-import AUC
+import           AUC
 
-data PlayState =  PlayState { _deck :: AUDeck , _tsv :: Float  , _psv :: Float , _gc :: Int }
+data PlayState =
+  PlayState
+    { _deck     :: AUDeck
+    , _tsv      :: Double
+    , _psv      :: Double
+    , _gc       :: Int
+    , _nslice   :: Int
+    , _isample  :: Int
+    , _islice   :: Int
+    , _rndprcnt :: Double
+    }
 
-initState = pure $ PlayState [] 1.0 1.0 100
+initState = pure $ PlayState [] 8.0 1.0 75 8 0 7 40
 
 mainWait ::
      JackExc.ThrowsErrno e
@@ -58,58 +71,225 @@ mainWait client name psr =
     putStrLn $ "started " ++ name ++ "..."
     hSetBuffering stdout NoBuffering
     hSetBuffering stdin NoBuffering
-
-    lib <- createAULib ["fatamen.wav","kleinekakanudel.wav"]
-    let s1 = AUSel lib "kleinekakanudel.wav" 0 66000
-    let s2 = AUSel lib "fatamen.wav" 3000 71325
-    let s3 = AUSel lib "fatamen.wav" 20000 54325
-
+    lib <-
+      createAULib
+        [ "fatamen.wav"
+        , "GM1.wav"
+        , "Dancing.wav"
+        , "Fat_On_Funk_1.wav"
+        , "Fat_On_Funk_2.wav"
+        , "Fools_Gold.wav"
+        , "Football.wav"
+        , "Funky_Mule_Intro.wav"
+        , "Funky_Soul_Shake_2.wav"
+        , "Fuzz_And_Da_Boog.wav"
+        , "Getaway.wav"
+        , "Get_Ready.wav"
+        , "Getting_It_Out_Of_My_System_1.wav"
+        , "Hard_Way_To_Go.wav"
+        , "Hoppin_John.wav"
+        , "Hot_Pants.wav"
+        , "Mary_Mary.wav"
+        , "New_Orleans.wav"
+        , "Party_Time.wav"
+        , "Sandy.wav"
+        , "Shackup.wav"
+        , "This_Is_My_Love.wav"
+        ]
     forever $ do
       ps <- readIORef psr
+      let sn = M.keys lib !! (_isample ps `mod` M.size lib)
+      let ss = sliceTo (_nslice ps) lib sn
+      putStrLn "Creating Extractor"
+      let aux =
+            [ \s -> AUX s 0 defaultPhsr False (cVol 1)
+            , \s ->
+                AUX s 0 (defaultPhsr <> stutterPhsr 0.1) False (linFadeInEnv 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (pitchPhsr 0.5 <> stutterPhsr 0.1)
+                  False
+                  (linFadeInEnv 1.3)
+            , \s -> AUX s 0 (pitchPhsr 0.5) False (linFadeInEnv 1.3)
+            , \s -> AUX s 0 (pitchPhsr (1 + (6 * (0.5 / 12)))) False (cVol 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (defaultPhsr <> stutterPhsr 0.25)
+                  False
+                  (linFadeOutEnv 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (defaultPhsr <> stutterPhsr 0.125)
+                  False
+                  (linFadeOutEnv 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (defaultPhsr <>
+                   stutterPhsr 0.125 <>
+                   timestretchPhsr (_gc ps) (_tsv ps) (_psv ps))
+                  False
+                  (linFadeOutEnv 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (reversePhsr <> timestretchPhsr (_gc ps) (_tsv ps) (_psv ps))
+                  False
+                  (linFadeOutEnv 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (defaultPhsr <> stutterPhsr 0.333)
+                  False
+                  (linFadeOutEnv 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (reversePhsr <> stutterPhsr 0.125)
+                  False
+                  (linFadeOutEnv 1)
+            , \s ->
+                AUX
+                  s
+                  0
+                  (timestretchPhsr (_gc ps) (_tsv ps) (_psv ps))
+                  False
+                  (cVol 1)
+            , \s -> AUX s 0 (defaultPhsr <> reversePhsr) False (cVol 1)
+            ]
+      putStrLn "Rendering Deck"
+      g <- newStdGen
+      let st = AUCState 1 g
+      let (s, _, ()) =
+            runAUC AUCEnv st g $ do
+              let rndRepeat [] = pure []
+                  rndRepeat (i:is) = do
 
-      let aux1 = AUX s1 0 (defaultPhsr) False (cVol 1.0)
-      let aux2 = AUX s2 0 (reversePhsr) False (cVol 1.0)
-      let aux3 = AUX s3 0 (defaultPhsr <> stutterPhsr 0.1) False (linFadeOutEnv 1.0)
-      let aux4 = AUX s1 0 (timestretchPhsr (_gc ps) (_psv ps) (_tsv ps)) False (cVol 1.0)
+                    probRep <- getRandomR (1, 100 :: Int)
+                    numRep <- getRandomR (1, 4 :: Int)
+                    ins <- replicateM numRep (getRandomR (0,(_nslice ps - 1)))
 
-
-      let auxA = AUXS [aux1,aux2,aux3]
-      let auxB = AUXP [aux1,aux2,aux3]
-      let auxC = aux4
-
+                    return $
+                      if
+                        | probRep > 20 -> (i : ins ++ is)
+                        | True -> (i : is)
+              let pat = [0 .. (_nslice ps - 1)]
+              ac <- getRandomR (4, 8)
+              patM <- concat <$> replicateM ac (rndRepeat pat)
+              d <-
+                foldl1 (<>) <$>
+                (mapM
+                   (\i
+                                  --ds <- getRandomR (1, 2)
+                     -> do
+                      let ds = 1
+                      s <-
+                        replicateM
+                          ds
+                          (do si <- getRandomR (0, length ss - 1)
+                              ai <- getRandomR (0, length aux - 1)
+                              prb <- getRandomR (0, 100 :: Double)
+                              let xtr =
+                                    if prb < _rndprcnt ps
+                                      then (aux !! ai)
+                                      else (\s ->
+                                              AUX s 0 defaultPhsr False (cVol 1))
+                                          --return $ (aux !! ai) (ss !! si))
+                              return $ xtr (ss !! i))
+                      return [AUXP s]) 
+                   $ patM  )
+              return $ AUXS d
+      let auxD = s
       putStr ">"
       inp <- getChar
       case inp of
+        'q' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_rndprcnt = _rndprcnt ps - 1}
+        'w' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_rndprcnt = _rndprcnt ps + 1}
+        'o' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_nslice = _nslice ps - 1}
+        'p' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_nslice = _nslice ps + 1}
         'n' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _tsv = _tsv ps - 0.1 }
+          writeIORef psr $ ps {_tsv = _tsv ps - 0.1}
         'm' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _tsv = _tsv ps + 0.1 }
+          writeIORef psr $ ps {_tsv = _tsv ps + 0.1}
         'j' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _psv = _psv ps - 0.1 }
+          writeIORef psr $ ps {_psv = _psv ps - 0.1}
         'k' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _psv = _psv ps + 0.1 }
+          writeIORef psr $ ps {_psv = _psv ps + 0.1}
+        'y' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_isample = (_isample ps - 1) `mod` M.size lib}
+        'x' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_isample = (_isample ps + 1) `mod` M.size lib}
+        'c' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_islice = (_islice ps - 1) `mod` _nslice ps}
+        'v' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_islice = (_islice ps + 1) `mod` _nslice ps}
         'u' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _gc = _gc ps - 50 }
+          writeIORef psr $ ps {_gc = _gc ps - 1}
         'i' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _gc = _gc ps + 50 }
+          writeIORef psr $ ps {_gc = _gc ps + 1}
+        'U' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_gc = _gc ps - 10}
+        'I' -> do
+          ps <- readIORef psr
+          writeIORef psr $ ps {_gc = _gc ps + 10}
         'a' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _deck = (auxA : (_deck ps)) }
+          writeIORef psr $ ps {_deck = (auxD : (_deck ps))}
         'b' -> do
           ps <- readIORef psr
-          writeIORef psr $ ps { _deck = (auxC : (_deck ps)) }
-        _   -> pure ()
-        
+          let x = ss !! (_islice ps)
+              --s = AUX x 0 (defaultPhsr) False (cVol 1)
+              s =
+                AUX
+                  x
+                  0
+                  (timestretchPhsr (_gc ps) (_tsv ps) (_psv ps))
+                  False
+                  (cVol 1)
+          writeIORef psr $ ps {_deck = (s : (_deck ps))}
+        _ -> pure ()
       ps <- readIORef psr
-      putStrLn $  " TSV : " ++ (show $ _tsv ps) 
-               ++ " PSV : " ++ (show $ _psv ps) 
-               ++ " GC  : " ++ (show $ _gc ps) 
+      putStrLn $
+        "Sample : " ++
+        sn ++
+        " SC  : " ++
+        (show $ _nslice ps) ++
+        " SlIdx : " ++
+        (show $ _islice ps) ++
+        " TSV : " ++
+        (show $ _tsv ps) ++
+        " PSV : " ++
+        (show $ _psv ps) ++
+        " GC  : " ++ (show $ _gc ps) ++ " RndPrcnt  : " ++ (show $ _rndprcnt ps)
     Jack.waitForBreak
 
 main :: IO ()
@@ -144,8 +324,8 @@ processAudioOut psr input output nframes@(JACK.NFrames nframesInt) = do
                then return ()
                else case MMC.messageBody ct of
                       MMC.Mode _ -> return ()
-                      MMC.Voice vt ->
-                        if {-| isSampSelectCntrl vt ->
+                      MMC.Voice vt
+                           {-| isSampSelectCntrl vt ->
                              do let (MMV.Control _ cv) = vt
                                 setSampSelect psr cv
                            | isMasterVolCntrl vt ->
@@ -202,7 +382,7 @@ processAudioOut psr input output nframes@(JACK.NFrames nframesInt) = do
                                   ((+) (mpitch ps) (MMV.fromPitch p))
                                   (bank ps)
                                   (ss) -}
-                           | otherwise -> return ())
+                       -> if | otherwise -> return ())
       mel
     outArr <- Audio.getBufferArray output nframes
     case JACK.nframesIndices nframes of
@@ -211,20 +391,13 @@ processAudioOut psr input output nframes@(JACK.NFrames nframesInt) = do
         mapM_
           (\i@(JACK.NFrames ii) -> do
              f <- nextFrame psr i
-             writeArray outArr i (CT.CFloat f))
+             writeArray outArr i (CT.CFloat $ double2Float f))
           idxs
 
-
-nextFrame :: IORef PlayState -> Jack.NFrames -> IO Float
+nextFrame :: IORef PlayState -> Jack.NFrames -> IO Double
 nextFrame psr i = do
   ps <- readIORef psr
   g <- newStdGen
-  let (s,_,d') = (runAUC (_deck ps) (AUCState 1.0 g) g nextFrameFromDeck) 
-  writeIORef psr $ ps { _deck = d' }
+  let (s, _, d') = (runAUC (_deck ps) (AUCState 1.0 g) g nextFrameFromDeck)
+  writeIORef psr $ ps {_deck = d'}
   return s
-
-
-
-
-
-

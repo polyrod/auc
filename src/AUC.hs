@@ -23,6 +23,7 @@ module AUC
   , AUDeck
   , renderDeckBS
   , nextFrameFromDeck
+  ,sliceTo
   ) where
 
 --  atest ,
@@ -40,7 +41,7 @@ import qualified Sound.File.Sndfile.Buffer.Vector as BV
 
 import           Sound.ProteaAudio
 
-import           Data.Fixed                       (mod')
+import           Data.Fixed                       (mod',divMod')
 import           Data.Maybe                       (fromMaybe)
 
 import           Control.Monad
@@ -80,6 +81,13 @@ instance Monoid Float where
 instance Semigroup Float where
   a <> b = a * b
 
+instance Monoid Double where
+  mempty = 1.0
+
+instance Semigroup Double where
+  a <> b = a * b
+
+
 newtype AUC r w s a =
   AUC
     { getAUC :: RWST r w s (Rand StdGen) a
@@ -104,11 +112,11 @@ type AUOff = Int
 
 type AUTick = Int
 
-type AURatio = Float
+type AURatio = Double
 
-type AUVol = Float
+type AUVol = Double
 
-type AUSample = Float
+type AUSample = Double
 
 data AUIdx
   = Rel AURatio
@@ -136,6 +144,13 @@ data AUSel =
 --  | Ser AUSel AUSel
 --
 --
+
+sliceTo :: Int -> AULib -> String -> [AUSel]
+sliceTo n lib smpl = case M.lookup smpl lib of
+  Nothing -> []
+  Just s -> let sl = _dur s `div` n
+             in map (\i -> AUSel lib smpl (i*sl) sl) [0..(n-1)]   
+
 
 data AUX
   = AUXS [AUX]
@@ -284,27 +299,46 @@ timestretchPhsr gc p' t' =
     st <- get
     let idx = getIdx st
     sel <- asks _sel
+    ticks <- asks _ticks
+    let len = _len sel
+
     if idx == Done
       then return idx
       else do
         let p = p' 
         let t = t' 
-        let gs = fromIntegral (_len sel) / fromIntegral gc
-            r = fromRel sel idx
-            g = (r) * (fromIntegral gc)
-            gn =  fromIntegral $ truncate g
-            gi = ((g - gn) * t) `mod'` 1
-            r' = (p/t) * (gn + gi) / fromIntegral gc
-            out =  " r: " ++ (show r)
-                ++ " g: " ++ (show g)
-                ++ " gn: " ++ (show gn)
-                ++ " gi: " ++ (show gi)
-                ++ " r': " ++ (show r')
+          {-
+
+                  outsweep = r * gc
+                  outslot = truncate outsweep
+                  inslot = outslot / t
+                  oslotphsr = outsweep - outslot
+                  islotphsr = t * oslotphsr % 1
+                  insweep = (inslot + islotphsr) / gc 
+
+          -}
+        --let r = fromIntegral ticks / (fromIntegral len)
+        let r = fromRel sel idx
+            outsweep = r * fromIntegral gc   -- grain progression
+            outslot =  fromIntegral $ truncate outsweep  -- integral grain number
+            inslot = outslot / t 
+            oslotphsr = outsweep - outslot
+            islotphsr = p * (oslotphsr  `mod'` (t))
+            insweep = (inslot + islotphsr) / fromIntegral gc
+            r' = insweep
             vs =
-              if | (g-gn) < (1 / 100) -> linFadeInEnv 1 (g-gn) 
-                 | (g-gn) > (1 - (1 / 100)) -> linFadeOutEnv 1 (g-gn)
+              if | (islotphsr) < (1 /fromIntegral (1000)) -> linFadeInEnv 1 (islotphsr) 
+                 | (islotphsr) > (1 - (1/fromIntegral (1000))) -> linFadeOutEnv 1 (islotphsr)
                  | True -> 1
-        tell (*vs)
+            out =  " r: " ++ show r
+                ++ " outsweep: " ++ show outsweep
+                ++ " outslot: " ++ show outslot
+                ++ " inslot: " ++ show inslot
+                ++ " oslotphsr: " ++ show oslotphsr
+                ++ " islotphsr: " ++ show islotphsr
+                ++ " insweep: " ++ show insweep
+                ++ " vs: " ++ show vs
+        tell (*1.0)
         let idx' = checkRel $ Rel r'
         put $ putIdx idx' st
         return idx'
@@ -344,8 +378,10 @@ renderDeck' d v =
 -}
 
 auxDone :: AUX -> Bool
-auxDone (AUXS _) = False
-auxDone (AUXP _) = False
+auxDone (AUXS []) = True
+auxDone (AUXS _ ) = False
+auxDone (AUXP []) = True
+auxDone (AUXP as) = all auxDone as
 auxDone aux = _done aux
 
 nextFrameFromDeck :: AUC AUDeck AUDeck AUCState AUSample
@@ -373,13 +409,13 @@ renderDeckBS' d b = do
       as = map aux etrip
   if null d'
     then return $ BS.toLazyByteString b
-    else renderDeckBS' as (b <> BS.floatLE s)
+    else renderDeckBS' as (b <> BS.doubleLE s)
 
 extract :: MonadState AUCState m => AUX -> m (AUX, AUIdx, AUSample)
 extract (AUXS [aux]) = extract aux 
 extract (AUXS (aux:auxs)) = do
   (aux',idx,s) <- extract aux
-  if idx == Done
+  if auxDone aux'
     then return (AUXS auxs,Abs 0,s)
     else return (AUXS (aux':auxs),idx,s)
 
@@ -390,8 +426,8 @@ extract (AUXP auxs) = do
       smp (_, _, s) = s
   etrip <- mapM extract d'
   let s = foldl (\a b -> a + smp b) 0 etrip
-      as = map aux etrip
-  return (AUXP as,Done,s)
+      as = filter (not . auxDone) $ map aux etrip
+  return (AUXP as,undefined,s)
       
 
 extract aux = do
@@ -444,7 +480,7 @@ loadSample fn = do
   (info, Just x) <- SF.readFile fn
   print info
   return $
-    SV.map (* 0.33) $
+    SV.map (* 0.25) $
     if SF.channels info == 2
       then SV.fromList $ toOneChannel $ SV.toList $ BV.fromBuffer x
       else BV.fromBuffer x
