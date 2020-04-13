@@ -185,7 +185,7 @@ mainWait client name psr =
                         | True -> (i : is)
               let pat = [0 .. (_nslice ps - 1)]
               ac <- getRandomR (4, 8)
-              patM <- concat <$> replicateM ac (rndRepeat pat)
+              patM <- concat <$> replicateM ac ((<> pat) <$> rndRepeat pat)
               d <-
                 foldl1 (<>) <$>
                 (mapM
